@@ -13,6 +13,7 @@ class RewriteRequest(BaseModel):
     bottleneck_type: str
     relation_name: str
     rows_filtered: int
+    actual_rows: int = 0
 
 # Response model
 class RewriteResponse(BaseModel):
@@ -52,6 +53,27 @@ def rewrite_query(request: RewriteRequest):
     if request.rows_filtered > 5000 and "LIMIT" not in request.query.upper():
         rewritten, rule = apply_limit_suggestion(rewritten)
         rules_applied.append(rule)
+
+    # Rule 4: No WHERE clause on large table
+    if "WHERE" not in request.query.upper() and request.actual_rows > 5000:
+        rewritten, rule = apply_missing_where_clause(rewritten)
+        rules_applied.append(rule)
+        if not explanation:
+            explanation = "Query has no WHERE clause — scanning entire table. Added a default date filter as a starting point."
+            estimated_improvement = "Up to 10x faster with proper filtering"
+
+    # Rule 5: ORDER BY without LIMIT
+    rewritten, rule = apply_order_by_optimization(rewritten)
+    if rule:
+        rules_applied.append(rule)
+
+    # Rule 6: DISTINCT → GROUP BY
+    rewritten, rule = apply_distinct_optimization(rewritten)
+    if rule:
+        rules_applied.append(rule)
+        if not explanation:
+            explanation = "DISTINCT is often slower than GROUP BY on large datasets."
+            estimated_improvement = "Up to 3x faster with GROUP BY"
 
     if not rules_applied:
         explanation = "No obvious rewrite rules apply. Query looks reasonable."
@@ -113,3 +135,25 @@ def apply_select_star_fix(query: str):
 def apply_limit_suggestion(query: str):
     rewritten = query.rstrip(";") + " LIMIT 1000;"
     return rewritten, "add_limit"
+
+def apply_missing_where_clause(query: str):
+    rewritten = query.rstrip(";") + " WHERE created_at >= NOW() - INTERVAL '30 days';"
+    return rewritten, "add_where_clause"
+
+def apply_order_by_optimization(query: str):
+    if "ORDER BY" in query.upper() and "LIMIT" not in query.upper():
+        rewritten = query.rstrip(";") + " LIMIT 100;"
+        return rewritten, "limit_order_by"
+    return query, None
+
+def apply_distinct_optimization(query: str):
+    if "DISTINCT" in query.upper():
+        rewritten = re.sub(
+            r'SELECT\s+DISTINCT',
+            'SELECT',
+            query,
+            flags=re.IGNORECASE
+        )
+        rewritten = rewritten.rstrip(";") + " GROUP BY id, customer_name, product, amount, created_at;"
+        return rewritten, "replace_distinct_with_group_by"
+    return query, None
